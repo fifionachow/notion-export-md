@@ -1,19 +1,26 @@
 import os
+import sys
 from pathlib import Path
 import json
 from urllib import parse, request
 import logging
+import subprocess
+import argparse
+
+from markdown import *
+from config import HUGO_BACKEND_DIR, NOTION_PAGE, NOTION_DATABASE, GH_USER, GH_REPO
+from gh_utils import create_pull_request
+
 from notion_client import Client
 
-import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.dirname(SCRIPT_DIR))
-from data_classes.markdown import *
 
-from config import HUGO_BACKEND_DIR, NOTION_PAGE, NOTION_DATABASE
+log_level = logging.INFO
+log_format = '[%(asctime)s] [%(levelname)s] - %(message)s'
+logging.basicConfig(level=log_level, format=log_format)
 
+READY_STATUS = 'Ready to Publish'
 NEW_LINE = '\n'
-
 FM_KEYS = {
     "Draft": "draft",
     "Date": "date",
@@ -23,8 +30,12 @@ FM_KEYS = {
     "Series": "series"
 }
 
+slugs = []
+
 def get_id_from_url(url):
-    return parse.urlparse(url).path.split('/')[-1]
+    url_path = parse.urlparse(url).path
+    url_page = url_path.split('/')[-1]
+    return url_page.split('-')[-1]
 
 def get_property(property):
     _type = property['type']
@@ -62,29 +73,35 @@ def parse_notion_block(block_type, block_content, content, enum):
     elif block_type == 'divider':
         divider = '---'
         content += divider
-    elif block_type == "heading_2":
+    elif block_type.startswith("heading"):
         content = md_heading(join_md_text(block_content), block_type)
     elif block_type == 'code':
-        print('Not implemented yet')
+        logging.error('Not implemented yet')
+    elif block_type == 'quote':
+        content = md_quote(block_content)
     else:
         raise Exception(f'BLOCK TYPE - {block_type} - not implemented yet - {block_content}')
     return content
 
-def get_notion_blocks(notion_client, page_id, asset_dir, content_start=""):
+def get_notion_blocks(notion_client, page_id, asset_dir, content_start="", is_child=False):
     returned_block = notion_client.blocks.children.list(page_id)
 
     md_blocks = []
     enum = 1
     
     for block in returned_block['results']:
-        content = content_start
         block_type = block['type']
         block_content = block[block_type]
+
+        if is_child:
+            content = '\t' + content_start
+        else:
+            content = content_start
 
         if block_type == 'image':
             content = md_image(block_content, asset_dir)
         else:
-            content = parse_notion_block(block_type, block_content, content)
+            content = parse_notion_block(block_type, block_content, content, enum)
     
         if block_type in ('numbered_list_item'):
             enum += 1
@@ -96,34 +113,23 @@ def get_notion_blocks(notion_client, page_id, asset_dir, content_start=""):
         elif isinstance(content, list):
             md_blocks += content
         else:
-            print(f'CONTENT TYPE UNKNOWN - {type(content)} - {content}')
+            logging.error(f'CONTENT TYPE UNKNOWN - {type(content)} - {content}')
 
         # Get children blocks
         if block['has_children']:
-            content = '\t' + content
-            md_blocks += get_notion_blocks(notion_client, block['id'], asset_dir, content)
+            content = content_start
+            md_blocks += get_notion_blocks(notion_client, block['id'], asset_dir, content_start=content, is_child=True)
 
     return md_blocks
 
-if __name__ == '__main__':
-    hugo_root = Path(HUGO_BACKEND_DIR)
-    page_url = NOTION_PAGE
-    hugo_content_root = hugo_root/'content/posts'
-    static_root = hugo_root/'static'
-
-    notion = Client(auth=os.environ["NOTION_API_KEY"], log_level=logging.INFO)
-
-    # TODO: To get pages from Status="publishing"
-    # for now, script exports 1 specific Notion page
-    
-    # Page Info
-    page_id = get_id_from_url(page_url)
+def notion2md(notion, page_id, static_root, hugo_content_root):
     returned_page = notion.pages.retrieve(page_id)
 
     # Hugo Front Matter
     front_matter = create_front_matter(returned_page, FM_KEYS)
     front_matter_str = stringify_front_matter(front_matter)
     post_slug = front_matter['slug'].replace('"','')
+    slugs.append(post_slug)
 
     # Block Info
     post_asset_dir = static_root/post_slug
@@ -131,11 +137,13 @@ if __name__ == '__main__':
     notion_blocks = get_notion_blocks(notion, page_id, post_asset_dir)
 
     # EXPORT
-    series_name = front_matter['series']
-    post_name = f"{post_slug}-{page_id}.md"
+    series_name = json.loads(front_matter['series'])
+    post_name = f"{post_slug}-{page_id.replace('-', '')}.md"
 
     if series_name:
-        out_md_file = hugo_content_root/series_name[0]/post_name
+        out_md_dir = hugo_content_root/series_name[0]
+        out_md_dir.mkdir(exist_ok=True, parents=True)
+        out_md_file = out_md_dir/post_name
     else:
         out_md_file = hugo_content_root/post_name
 
@@ -145,3 +153,66 @@ if __name__ == '__main__':
         out_file.write(f"{NEW_LINE*2}".join(notion_blocks))
 
     logging.info(f'Page extracted - {post_name}')
+    return post_slug
+
+def publish_to_gitpages(slug):
+    custom_message = f"Added/updated post - {slug}"
+    deployment_script = f"{SCRIPT_DIR}/deploy.sh"
+    subprocess.call(['sh', deployment_script, custom_message])
+
+def update_notion_page_status(notion, page_id):
+    page_status = "Published"
+    update_payload = {"properties":{"Status":{"select":{"name":page_status}}}}
+    
+    returned_request = notion.pages.update(page_id, **update_payload)
+    updated_status = returned_request['properties']['Status']['select']['name']
+    logging.debug(f'Updated: {returned_request}')
+
+    if updated_status == page_status:
+        logging.info('Notion Page status updated')
+
+def get_notion_posts(notion, database_id, status):
+    query = {
+            "database_id": database_id,
+            "filter":{"property":"Status","select":{"equals":status}}
+        }
+
+    results = notion.databases.query(**query)['results']
+    page_ids = [result['id'] for result in results]
+    return page_ids
+
+def main(publish=False):
+    hugo_root = Path(HUGO_BACKEND_DIR)
+    hugo_content_root = hugo_root/'content/posts'
+    static_root = hugo_root/'static'
+    
+    notion = Client(auth=os.environ["NOTION_API_KEY"], log_level=logging.ERROR)
+
+    if NOTION_PAGE:
+        page_id = get_id_from_url(NOTION_PAGE)
+        ready_list = [page_id]
+    else:
+        database_id = get_id_from_url(NOTION_DATABASE)
+        ready_list = get_notion_posts(notion, database_id, status=READY_STATUS)
+
+    logging.info(f"Notion posts ready for publishing - {len(ready_list)}")
+
+    for page_id in ready_list:
+        post_slug = notion2md(notion, page_id, static_root, hugo_content_root)
+        if publish:
+            publish_to_gitpages(post_slug)
+            update_notion_page_status(notion, page_id)
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--publish", action='store_false')
+    args = parser.parse_args()
+
+    # exports Notion page(s) as markdowns
+    main(publish=args.publish)
+
+    pr_title = f"Articles to publish - {len(slugs)}"
+    pr_body = f'List of new/updated articles:\n{"\n".join(slugs)}'
+    pr_link = create_pull_request(GH_USER, GH_REPO, title=pr_title, body=pr_body)
+    logging.info(f"Pull Request created - {pr_link}")
